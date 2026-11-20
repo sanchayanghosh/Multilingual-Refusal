@@ -102,7 +102,7 @@ class Gemma2Model(ModelBase):
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            device_map="cuda",
+            device_map="auto",
             attn_implementation="eager",
         ).eval()
 
