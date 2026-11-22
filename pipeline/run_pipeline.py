@@ -7,7 +7,6 @@ import sys
 import mmengine
 import jsonpickle
 
-from dataset.load_dataset import load_dataset_split, load_dataset
 from datasets import Dataset, DatasetDict
 from huggingface_hub import HfApi, login
 
@@ -19,7 +18,11 @@ from pipeline.utils.hook_utils import (
     add_hooks,
 )
 from pipeline.submodules.generate_directions import generate_directions
-from pipeline.submodules.select_direction import select_direction, get_refusal_scores, randomly_select_direction
+from pipeline.submodules.select_direction import (
+    select_direction,
+    get_refusal_scores,
+    randomly_select_direction,
+)
 from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
 from pipeline.submodules.evaluate_loss import evaluate_loss
 from pipeline.evaluator.evalharness import LMEvalHarness
@@ -32,6 +35,26 @@ def parse_arguments():
     parser.add_argument('--model_path', type=str, required=False, default=None, help='Path to the model')
     parser.add_argument('--batch_size', type=int, required=False, default=None, help='Batch size')
     return parser.parse_args()
+
+
+def get_dataset_loaders(cfg):
+    """
+    Dynamically selects IndicSafe or PolyRefuse dataset loaders based on
+    `cfg.dataset_source` or whether 'indicsafe' appears in the HF repo IDs.
+    """
+    source = getattr(cfg, "dataset_source", None)
+    if source is None:
+        repo_str = f"{getattr(cfg, 'hf_repo_id', '')} {getattr(cfg, 'hf_activations_repo_id', '')}".lower()
+        source = "indicsafe" if "indicsafe" in repo_str else "polyrefuse"
+
+    if source.lower() == "indicsafe":
+        print("[Dataset Loader] Using IndicSafe (dataset.load_dataset_indicsafe)")
+        from dataset.load_dataset_indicsafe import load_dataset_split, load_dataset
+    else:
+        print("[Dataset Loader] Using PolyRefuse (dataset.load_dataset)")
+        from dataset.load_dataset import load_dataset_split, load_dataset
+
+    return load_dataset_split, load_dataset
 
 
 def init_hf():
@@ -77,6 +100,12 @@ def extract_and_checkpoint_split(
         end_idx = min(start_idx + checkpoint_every, len(prompts))
         chunk_prompts = prompts[start_idx:end_idx]
 
+        # Ensure plain instruction strings for tokenization and HF Dataset schema consistency
+        chunk_prompt_strs = [
+            p["instruction"] if isinstance(p, dict) else p
+            for p in chunk_prompts
+        ]
+
         chunk_layer_acts = {layer_idx: [] for layer_idx in range(num_layers)}
 
         def get_capture_hook(layer_idx):
@@ -92,9 +121,9 @@ def extract_and_checkpoint_split(
         ]
 
         try:
-            sub_bs = min(cfg.batch_size, len(chunk_prompts))
-            for b_start in range(0, len(chunk_prompts), sub_bs):
-                batch_prompts = chunk_prompts[b_start : b_start + sub_bs]
+            sub_bs = min(cfg.batch_size, len(chunk_prompt_strs))
+            for b_start in range(0, len(chunk_prompt_strs), sub_bs):
+                batch_prompts = chunk_prompt_strs[b_start : b_start + sub_bs]
                 inputs = model_base.tokenize_instructions_fn(instructions=batch_prompts)
                 inputs = {k: v.to(model_base.model.device) for k, v in inputs.items()}
                 model_base.model(**inputs)
@@ -113,7 +142,7 @@ def extract_and_checkpoint_split(
         torch.save(
             {
                 "activations": chunk_tensor,
-                "prompts": chunk_prompts,
+                "prompts": chunk_prompt_strs,
                 "start_idx": start_idx,
                 "end_idx": end_idx,
                 "lang": cfg.source_lang,
@@ -131,10 +160,11 @@ def extract_and_checkpoint_split(
         )
 
         # 2. Update & upload prompt checkpoint
-        for offset, p_text in enumerate(chunk_prompts):
+        for offset, (raw_item, p_str) in enumerate(zip(chunk_prompts, chunk_prompt_strs)):
             accumulated_prompt_splits[split_name].append({
                 "index": start_idx + offset,
-                "prompt": p_text,
+                "prompt": p_str,
+                "category": raw_item.get("category", "") if isinstance(raw_item, dict) else "",
                 "shard_file": shard_filename,
                 "lang": cfg.source_lang,
                 "split": split_name,
@@ -204,18 +234,21 @@ class Logger:
         self.log.flush()
 
 
-def load_and_sample_datasets(cfg):
-    """Load datasets and sample them based on the configuration."""
+def load_and_sample_datasets(cfg, load_dataset_split_fn):
+    """Load datasets and sample them based on the configuration (clamped to dataset size)."""
     random.seed(cfg.random_seed)
-    data1_train = random.sample(load_dataset_split(harmtype=cfg.harmtype_1, split='train', lang=cfg.source_lang, instructions_only=True), cfg.n_train)
-    data2_train = random.sample(load_dataset_split(harmtype=cfg.harmtype_2, split='train', lang=cfg.source_lang, instructions_only=True), cfg.n_train)
-    
-    data1_val = random.sample(load_dataset_split(harmtype=cfg.harmtype_1, split='val', lang=cfg.source_lang, instructions_only=True), cfg.n_val)
-    data2_val = random.sample(load_dataset_split(harmtype=cfg.harmtype_2, split='val', lang=cfg.source_lang, instructions_only=True), cfg.n_val) 
+    d1_tr = load_dataset_split_fn(harmtype=cfg.harmtype_1, split='train', lang=cfg.source_lang, instructions_only=True)
+    d2_tr = load_dataset_split_fn(harmtype=cfg.harmtype_2, split='train', lang=cfg.source_lang, instructions_only=True)
+    d1_va = load_dataset_split_fn(harmtype=cfg.harmtype_1, split='val', lang=cfg.source_lang, instructions_only=True)
+    d2_va = load_dataset_split_fn(harmtype=cfg.harmtype_2, split='val', lang=cfg.source_lang, instructions_only=True)
+
+    data1_train = random.sample(d1_tr, min(len(d1_tr), cfg.n_train))
+    data2_train = random.sample(d2_tr, min(len(d2_tr), cfg.n_train))
+    data1_val = random.sample(d1_va, min(len(d1_va), cfg.n_val))
+    data2_val = random.sample(d2_va, min(len(d2_va), cfg.n_val))
     return data1_train, data2_train, data1_val, data2_val
 
-
-def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val, system_harm, system_or, system_harmless):  
+def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val, system_harm, system_or, system_harmless):
     """Filter datasets based on refusal scores."""
     def filter_examples(dataset, scores, threshold, comparison):
         return [inst for inst, score in zip(dataset, scores.tolist()) if comparison(score, threshold)]
@@ -231,7 +264,7 @@ def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, har
         harmless_val_scores = get_refusal_scores(model_base.model, harmless_val, model_base.tokenize_instructions_fn, model_base.refusal_toks, system=system_harmless, batch_size=cfg.batch_size)
         harmful_val = filter_examples(harmful_val, harmful_val_scores, 0, lambda x, y: x > y)
         harmless_val = filter_examples(harmless_val, harmless_val_scores, 0, lambda x, y: x < y)
-    
+
     return harmful_train, harmless_train, harmful_val, harmless_val
 
 
@@ -246,7 +279,7 @@ def generate_and_save_candidate_directions(cfg, model_base, harmful_train, harml
         harmful_train,
         harmless_train,
         artifact_dir=os.path.join(cfg.artifact_path, "generate_directions"),
-        batch_size=cfg.batch_size
+        batch_size=cfg.batch_size,
     )
 
     torch.save(mean_diffs, os.path.join(cfg.artifact_path, 'generate_directions/mean_diffs.pt'))
@@ -279,16 +312,41 @@ def select_and_save_direction(cfg, model_base, harmful_val, harmless_val, candid
     return pos, layer, direction
 
 
-def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fwd_hooks, intervention_label, dataset_name, dataset=None, system=None):
+def generate_and_save_completions_for_dataset(
+    cfg,
+    model_base,
+    fwd_pre_hooks,
+    fwd_hooks,
+    intervention_label,
+    dataset_name,
+    dataset=None,
+    system=None,
+    load_dataset_fn=None,
+):
     """Generate and save completions for a dataset."""
     if not os.path.exists(os.path.join(cfg.artifact_path, 'completions')):
         os.makedirs(os.path.join(cfg.artifact_path, 'completions'))
 
     if dataset is None:
-        dataset = load_dataset(dataset_name)
+        if load_dataset_fn is None:
+            _, load_dataset_fn = get_dataset_loaders(cfg)
+        dataset = load_dataset_fn(dataset_name)
 
-    completions = model_base.generate_completions(dataset, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks, max_new_tokens=cfg.max_new_tokens, batch_size=cfg.batch_size, system=system)
-    
+    # Ensure every item is a dict with 'instruction' for model_base.generate_completions
+    dataset = [
+        {"instruction": x, "category": "harmful"} if isinstance(x, str) else x
+        for x in dataset
+    ]
+
+    completions = model_base.generate_completions(
+        dataset,
+        fwd_pre_hooks=fwd_pre_hooks,
+        fwd_hooks=fwd_hooks,
+        max_new_tokens=cfg.max_new_tokens,
+        batch_size=cfg.batch_size,
+        system=system,
+    )
+
     with open(f'{cfg.artifact_path}/completions/{dataset_name}_{intervention_label}_completions.json', "w") as f:
         json.dump(completions, f, indent=4)
 
@@ -303,7 +361,7 @@ def evaluate_completions_and_save_results_for_dataset(cfg, intervention_label, d
         methodologies=eval_methodologies,
         evaluation_path=os.path.join(cfg.artifact_path, "completions", f"{dataset_name}_{intervention_label}_evaluations.json"),
         cfg=cfg,
-        logger=None
+        logger=None,
     )
 
     with open(f'{cfg.artifact_path}/completions/{dataset_name}_{intervention_label}_evaluations.json', "w") as f:
@@ -315,7 +373,7 @@ def evaluate_loss_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, interv
     if not os.path.exists(os.path.join(cfg.artifact_path, 'loss_evals')):
         os.makedirs(os.path.join(cfg.artifact_path, 'loss_evals'))
 
-    on_distribution_completions_file_path = os.path.join(cfg.artifact_path, f'completions/harmless_baseline_completions.json')
+    on_distribution_completions_file_path = os.path.join(cfg.artifact_path, 'completions/harmless_baseline_completions.json')
     loss_evals = evaluate_loss(model_base, fwd_pre_hooks, fwd_hooks, batch_size=cfg.ce_loss_batch_size, n_batches=cfg.ce_loss_n_batches, completions_file_path=on_distribution_completions_file_path)
 
     with open(f'{cfg.artifact_path}/loss_evals/{intervention_label}_loss_eval.json', "w") as f:
@@ -329,7 +387,7 @@ def eval_harness(cfg, model_base, identifier):
         os.makedirs(f'{cfg.artifact_path}/lm_eval_results')
     with open(f'{cfg.artifact_path}/lm_eval_results/{identifier}_mmlu.json', "w") as f:
         f.write(jsonpickle.encode(lm_eval_results_mmlu, indent=4))
-      
+
     if 'eval_harness' in cfg:
         eval_harness_evaluator = LMEvalHarness(cfg.eval_harness)
         lm_eval_results = eval_harness_evaluator.evaluate(model=model_base)
@@ -337,7 +395,7 @@ def eval_harness(cfg, model_base, identifier):
             os.makedirs(f'{cfg.artifact_path}/lm_eval_results')
         with open(f'{cfg.artifact_path}/lm_eval_results/{identifier}.json', "w") as f:
             f.write(jsonpickle.encode(lm_eval_results, indent=4))
-    
+
     return lm_eval_results_mmlu
 
 
@@ -364,27 +422,32 @@ def run_pipeline(config_path, model_path, batch_size):
         cfg.model_path = model_path
     model_alias = os.path.basename(cfg.model_path)
     cfg.model_alias = model_alias
-    
+
     if batch_size is not None:
         cfg.batch_size = batch_size
-    
+
     if 'artifact_path' not in cfg:
         cfg.artifact_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "runs", cfg.model_alias)
-    
+
     sys.stdout = Logger(f"{cfg.artifact_path}/output.log")
     sys.stderr = Logger(f"{cfg.artifact_path}/error.log")
     cfg.dump(f'{cfg.artifact_path}/config_run.yaml')
-    
+
+    # Dynamically select IndicSafe or PolyRefuse dataset loaders
+    load_dataset_split, load_dataset = get_dataset_loaders(cfg)
+
     model_base = construct_model_base(cfg.model_path, cfg.source_lang)
-    
-    # Load and sample datasets
-    harmless_train, harmful_train, harmless_val, harmful_val = load_and_sample_datasets(cfg) 
+
+    # Load, sample, and filter datasets
+    harmless_train, harmful_train, harmless_val, harmful_val = load_and_sample_datasets(cfg, load_dataset_split)
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
         cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val,
         system_harm=None, system_or=None, system_harmless=None
     )
 
-    harmful_data = random.sample(load_dataset_split(harmtype='harmful', split='test', lang=cfg.source_lang), cfg.n_test)
+
+    test_pool = load_dataset_split(harmtype='harmful', split='test', lang=cfg.source_lang)
+    harmful_data = random.sample(test_pool, min(len(test_pool), cfg.n_test))
 
     # 1. Checkpointed extraction + HF upload every 5 prompts for both prompts and activations
     accumulated_prompt_splits = {}
@@ -421,7 +484,7 @@ def run_pipeline(config_path, model_path, batch_size):
 
         harm_actadd_fwd_pre_hooks, harm_actadd_fwd_hooks = [], []
         harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks = [], []
-        
+
         for pos_harm, layer_harm, direction_harm in zip(positions_harm, layers_harm, directions_harm):
             harm_actadd_fwd_pre_hooks.append(
                 (model_base.model_block_modules[layer_harm], get_activation_addition_input_pre_hook(vector=direction_harm, coeff=+cfg.addact_coeff))
@@ -431,9 +494,9 @@ def run_pipeline(config_path, model_path, batch_size):
             harm_ablation_fwd_hooks.extend(fwd_hooks)
 
         # Standard single-language evaluations
-        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'harmful', dataset=harmful_data, system=cfg.system)
-        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'xstest', system=cfg.system)
-        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'jailbreakbench', system=cfg.system)
+        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'harmful', dataset=harmful_data, system=cfg.system, load_dataset_fn=load_dataset)
+        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'xstest', system=cfg.system, load_dataset_fn=load_dataset)
+        generate_and_save_completions_for_dataset(cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks, 'harm_ablation', 'jailbreakbench', system=cfg.system, load_dataset_fn=load_dataset)
 
         for dataset_name in cfg.jailbreak_evaluation_datasets:
             evaluate_completions_and_save_results_for_dataset(cfg, 'harm_ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
@@ -441,15 +504,14 @@ def run_pipeline(config_path, model_path, batch_size):
         # Cross-lingual evaluations across eval_langs (Baseline, Ablation, and Addition for Figs 1-3)
         eval_langs = getattr(cfg, "eval_langs", ["en", "yo"])
         for eval_lang in eval_langs:
-            lang_test_data = random.sample(
-                load_dataset_split(harmtype="harmful", split="test", lang=eval_lang),
-                cfg.n_test,
-            )
+
+            lang_pool = load_dataset_split(harmtype="harmful", split="test", lang=eval_lang)
+            lang_test_data = random.sample(lang_pool, min(len(lang_pool), cfg.n_test))
 
             # Baseline
             generate_and_save_completions_for_dataset(
                 cfg, model_base, [], [], f"baseline_{eval_lang}", "harmful",
-                dataset=lang_test_data, system=cfg.system
+                dataset=lang_test_data, system=cfg.system, load_dataset_fn=load_dataset
             )
             evaluate_completions_and_save_results_for_dataset(
                 cfg, f"baseline_{eval_lang}", "harmful",
@@ -460,7 +522,7 @@ def run_pipeline(config_path, model_path, batch_size):
             generate_and_save_completions_for_dataset(
                 cfg, model_base, harm_ablation_fwd_pre_hooks, harm_ablation_fwd_hooks,
                 f"harm_ablation_{cfg.source_lang}_on_{eval_lang}", "harmful",
-                dataset=lang_test_data, system=cfg.system
+                dataset=lang_test_data, system=cfg.system, load_dataset_fn=load_dataset
             )
             evaluate_completions_and_save_results_for_dataset(
                 cfg, f"harm_ablation_{cfg.source_lang}_on_{eval_lang}", "harmful",
@@ -471,20 +533,21 @@ def run_pipeline(config_path, model_path, batch_size):
             generate_and_save_completions_for_dataset(
                 cfg, model_base, harm_actadd_fwd_pre_hooks, harm_actadd_fwd_hooks,
                 f"harm_actadd_{cfg.source_lang}_on_{eval_lang}", "harmful",
-                dataset=lang_test_data, system=cfg.system
+                dataset=lang_test_data, system=cfg.system, load_dataset_fn=load_dataset
             )
             evaluate_completions_and_save_results_for_dataset(
                 cfg, f"harm_actadd_{cfg.source_lang}_on_{eval_lang}", "harmful",
                 eval_methodologies=cfg.jailbreak_eval_methodologies
             )
 
-        with add_hooks(module_forward_pre_hooks=harm_ablation_fwd_pre_hooks, module_forward_hooks=harm_ablation_fwd_hooks):
-            lm_eval_results_harm_actadd = eval_harness(cfg, model_base, 'harm_ablation')
+        if getattr(cfg, "run_eval_harness", False):
+            with add_hooks(module_forward_pre_hooks=harm_ablation_fwd_pre_hooks, module_forward_hooks=harm_ablation_fwd_hooks):
+                eval_harness(cfg, model_base, 'harm_ablation')
 
     else:
-        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmful', dataset=harmful_data, system=cfg.system)
-        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'xstest', system=cfg.system)
-        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'jailbreakbench', system=cfg.system)
+        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmful', dataset=harmful_data, system=cfg.system, load_dataset_fn=load_dataset)
+        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'xstest', system=cfg.system, load_dataset_fn=load_dataset)
+        generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'jailbreakbench', system=cfg.system, load_dataset_fn=load_dataset)
         for dataset_name in cfg.jailbreak_evaluation_datasets:
             evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
 

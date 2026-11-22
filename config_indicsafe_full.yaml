@@ -1,0 +1,57 @@
+artifact_path: "/workspace/pipeline/runs/gemma-2-9b-it-indicsafe-full"
+model_alias: "gemma-2-9b-it"
+model_path: "google/gemma-2-9b-it"
+
+dataset_source: "indicsafe"
+
+# Dedicated Hugging Face repositories for the full run
+hf_namespace: "renessauce"
+hf_repo_id: "renessauce/gemma-2-9b-it-indicsafe-full-prompts"
+hf_activations_repo_id: "renessauce/gemma-2-9b-it-indicsafe-full-activations"
+
+# Full IndicSafe split counts (500 prompts/language -> 70% train / 10% val / 20% test)
+n_train: 350
+n_val: 50
+n_test: 100
+filter_train: true
+filter_or: false
+filter_val: true
+
+batch_size: 2
+
+# Languages to extract activations & directions for, and languages to evaluate
+source_lang: "en"
+lang: "en"
+source_langs: ["en", "hi"]
+eval_langs: ["en", "hi"]
+
+jailbreak_evaluation_datasets: ["harmful"]
+over_refusal_evaluation_datasets: ["or_bench_hard", "xstest", "oktest_100", "xstest_safe"]
+max_new_tokens: 128
+jailbreak_eval_methodologies: ["substring_matching"]
+refusal_eval_methodologies: ["substring_matching"]
+ce_loss_batch_size: 2
+ce_loss_n_batches: 2048
+harmtype_1: "harmless"
+harmtype_2: "harmful"
+
+addact_coeff: 1
+addact_coeff_sweep: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+kl_threshold: 0.1
+steer_kl_threshold: 2
+ablate_kl_threshold: 0.2
+start_layer: 0
+ortho_lambda: 0.8
+top_n: 1
+random_seed: 1
+filter: "above"
+baseline: false
+mode: harm_ablation
+ablation_coeff: 1.0
+run_eval_harness: false
+
+system: False
+
+data_loader:
+  batch_size: 1
+  shuffle: False

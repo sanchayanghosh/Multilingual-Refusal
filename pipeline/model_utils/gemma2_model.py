@@ -28,10 +28,19 @@ REFUSAL_TOKENS_LANG = {
     'yo': [12109,231349],
     'ko': [242903],
     'ja': [147553, 28213],
-    'ru': [236038, 29036]
+    'ru': [236038, 29036],
+    "hi": "मैं",      # Hindi ("I...")
+    "bn": "আমি",     # Bengali
+    "ta": "நான்",    # Tamil
+    "te": "నేను",     # Telugu
+    "mr": "मी",      # Marathi
+    "gu": "હું",      # Gujarati
+    "kn": "ನಾನು",    # Kannada
+    "ml": "ഞാൻ",     # Malayalam
 
 
 }
+
 
 def format_instruction_gemma_chat(
     instruction: str,
@@ -123,7 +132,17 @@ class Gemma2Model(ModelBase):
         return self.tokenizer.encode(GEMMA_CHAT_TEMPLATE.split("{instruction}")[-1], add_special_tokens=False)
 
     def _get_refusal_toks(self, lang):
-        return REFUSAL_TOKENS_LANG[lang]
+        if isinstance(lang, str) and lang in REFUSAL_TOKENS_LANG:
+            val = REFUSAL_TOKENS_LANG[lang]
+            if isinstance(val, list) and all(isinstance(x, int) for x in val):
+                return val
+        indic_prefixes = ["I", "मैं", "क्षमा", "माफ़"]
+        toks = []
+        for p in indic_prefixes:
+            ids = self.tokenizer.encode(p, add_special_tokens=False)
+            if ids:
+                toks.append(ids[0])
+        return list(dict.fromkeys(toks))
 
     def _get_model_block_modules(self):
         return self.model.model.layers

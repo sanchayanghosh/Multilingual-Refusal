@@ -1,0 +1,55 @@
+artifact_path: "/workspace/pipeline/runs/gemma-2-9b-it-indicsafe-hi"
+model_alias: "gemma-2-9b-it"
+model_path: "google/gemma-2-9b-it"
+
+dataset_source: "indicsafe"
+
+# Isolated Hugging Face repositories under renessauce
+hf_namespace: "renessauce"
+hf_repo_id: "renessauce/gemma-2-9b-it-indicsafe-prompts"
+hf_activations_repo_id: "renessauce/gemma-2-9b-it-indicsafe-activations"
+
+# Fast subset counts (~10-20 prompts per split)
+n_train: 16
+n_test: 16
+n_val: 8
+filter_train: true
+filter_or: false
+filter_val: true
+
+batch_size: 8
+
+source_lang: "hi"
+lang: "hi"
+eval_langs: ["en", "hi"]
+
+jailbreak_evaluation_datasets: ["harmful"]
+over_refusal_evaluation_datasets: ["or_bench_hard", "xstest", "oktest_100", "xstest_safe"]
+max_new_tokens: 128
+jailbreak_eval_methodologies: ["substring_matching"]
+refusal_eval_methodologies: ["substring_matching"]
+ce_loss_batch_size: 2
+ce_loss_n_batches: 2048
+harmtype_1: "harmless"
+harmtype_2: "harmful"
+
+addact_coeff: 1
+addact_coeff_sweep: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+kl_threshold: 0.1
+steer_kl_threshold: 2
+ablate_kl_threshold: 0.2
+start_layer: 0
+ortho_lambda: 0.8
+top_n: 1
+random_seed: 1
+filter: "above"
+baseline: false
+mode: harm_ablation
+ablation_coeff: 1.0
+run_eval_harness: false
+
+system: False
+
+data_loader:
+  batch_size: 1
+  shuffle: False
