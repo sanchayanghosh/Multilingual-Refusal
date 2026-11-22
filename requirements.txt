@@ -157,3 +157,4 @@ setuptools
 lm_eval
 mmengine
 jsonpickle
+seaborn
