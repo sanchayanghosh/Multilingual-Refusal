@@ -2,6 +2,10 @@ from pipeline.model_utils.model_base import ModelBase
 
 def construct_model_base(model_path: str, lang: str= 'en') -> ModelBase:
 
+    if 'aya' in model_path.lower():
+        from pipeline.model_utils.aya_expanse_model import AyaExpanseModel
+        return AyaExpanseModel(model_path, lang)
+
     if 'qwen2' in model_path.lower():
         from pipeline.model_utils.qwen2_model import Qwen2Model
         return Qwen2Model(model_path, lang)
