@@ -61,9 +61,12 @@ def load_config(args):
 
     if args.sanity:
         artifact_path = f"{artifact_path}-sanity"
-        cfg.n_train = 4
-        cfg.n_val = 2
+        cfg.n_train = 8
+        cfg.n_val = 4
         cfg.n_test = 4
+        cfg.filter_train = False
+        cfg.filter_val = False
+        cfg.filter_or = False
         cfg.batch_size = args.batch_size or 4
         cfg.max_new_tokens = 64
         for key in ["hf_repo_id", "hf_activations_repo_id", "hf_report_repo_id"]:
@@ -92,7 +95,6 @@ def init_hub(cfg, args):
 
 def run_pipeline_passes(cfg):
     source_langs = getattr(cfg, "source_langs", [cfg.source_lang])
-    pipeline_script = WORKSPACE / "pipeline" / "run_pipeline.py"
 
     for lang in source_langs:
         sub_cfg = copy.deepcopy(cfg)
@@ -104,7 +106,7 @@ def run_pipeline_passes(cfg):
         sub_cfg_path = os.path.join(sub_cfg.artifact_path, f"config_{lang}.yaml")
         sub_cfg.dump(sub_cfg_path)
 
-        cmd = [sys.executable, str(pipeline_script), "--config_path", sub_cfg_path]
+        cmd = [sys.executable, "-m", "pipeline.run_pipeline", "--config_path", sub_cfg_path]
         print(f"\n[Run] source_lang={lang}: {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, check=True, cwd=str(WORKSPACE))
 

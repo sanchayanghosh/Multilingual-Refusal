@@ -6,6 +6,7 @@ import argparse
 import sys
 import mmengine
 import jsonpickle
+import time
 
 from datasets import Dataset, DatasetDict
 from huggingface_hub import HfApi, login
@@ -72,13 +73,15 @@ def extract_and_checkpoint_split(
     prompts: list,
     split_name: str,
     accumulated_prompt_splits: dict,
-    checkpoint_every: int = 5,
+    checkpoint_every: int = 50,
+    upload_interval_sec: int = 360,  # Max ~5 uploads per 30 minutes (1 every 6 min)
 ):
     """
     Processes `prompts` in chunks of `checkpoint_every`:
-      1. Extracts all-layer EOI activations -> [chunk_size, eoi_len, num_layers, d_model]
-      2. Saves & uploads the activation shard immediately to HF Hub
-      3. Appends the chunk's prompts to `accumulated_prompt_splits` and pushes a prompt checkpoint
+      1. Saves activation shards locally every `checkpoint_every` prompts
+      2. Uploads accumulated shards to HF Hub in a single batched commit at most once
+         every `upload_interval_sec` seconds (and at the end of the split)
+      3. Pushes the prompt DatasetDict once at the end of the split
     """
     api = init_hf()
 
@@ -96,11 +99,12 @@ def extract_and_checkpoint_split(
     if split_name not in accumulated_prompt_splits:
         accumulated_prompt_splits[split_name] = []
 
+    last_upload_time = time.time()
+
     for start_idx in range(0, len(prompts), checkpoint_every):
         end_idx = min(start_idx + checkpoint_every, len(prompts))
         chunk_prompts = prompts[start_idx:end_idx]
 
-        # Ensure plain instruction strings for tokenization and HF Dataset schema consistency
         chunk_prompt_strs = [
             p["instruction"] if isinstance(p, dict) else p
             for p in chunk_prompts
@@ -136,7 +140,7 @@ def extract_and_checkpoint_split(
             dim=2
         )
 
-        # 1. Save & upload this activation shard
+        # 1. Save shard locally
         shard_filename = f"shard_{start_idx:05d}_{end_idx:05d}.pt"
         local_shard_path = os.path.join(shard_dir, shard_filename)
         torch.save(
@@ -151,15 +155,6 @@ def extract_and_checkpoint_split(
             local_shard_path,
         )
 
-        api.upload_file(
-            path_or_fileobj=local_shard_path,
-            path_in_repo=f"{cfg.source_lang}/activations/{split_name}/{shard_filename}",
-            repo_id=acts_repo_id,
-            repo_type="dataset",
-            commit_message=f"[{split_name}] Activation shard {start_idx}-{end_idx}/{len(prompts)}",
-        )
-
-        # 2. Update & upload prompt checkpoint
         for offset, (raw_item, p_str) in enumerate(zip(chunk_prompts, chunk_prompt_strs)):
             accumulated_prompt_splits[split_name].append({
                 "index": start_idx + offset,
@@ -170,19 +165,35 @@ def extract_and_checkpoint_split(
                 "split": split_name,
             })
 
-        ds_dict = DatasetDict({
-            s_name: Dataset.from_list(rows)
-            for s_name, rows in accumulated_prompt_splits.items()
-            if len(rows) > 0
-        })
-        ds_dict.push_to_hub(
-            prompts_repo_id,
-            private=True,
-            commit_message=f"[{split_name}] Prompts checkpoint {end_idx}/{len(prompts)}",
-        )
+        # 2. Upload to HF only if >= 6 minutes (360s) have elapsed or this is the final chunk
+        is_last_chunk = (end_idx == len(prompts))
+        elapsed = time.time() - last_upload_time
 
-        print(f"[Checkpoint {end_idx}/{len(prompts)}] Uploaded {split_name} prompts + {shard_filename}")
+        if elapsed >= upload_interval_sec or is_last_chunk:
+            api.upload_folder(
+                folder_path=shard_dir,
+                path_in_repo=f"{cfg.source_lang}/activations/{split_name}",
+                repo_id=acts_repo_id,
+                repo_type="dataset",
+                commit_message=f"[{split_name}] Activation shards up to {end_idx}/{len(prompts)}",
+            )
+            last_upload_time = time.time()
+            print(f"[HF Upload {end_idx}/{len(prompts)}] Synced {split_name} shards to Hub")
+        else:
+            print(f"[Local Checkpoint {end_idx}/{len(prompts)}] Saved {shard_filename} locally")
 
+    # 3. Push prompt metadata once per split (1 commit per split instead of every 5 prompts)
+    ds_dict = DatasetDict({
+        s_name: Dataset.from_list(rows)
+        for s_name, rows in accumulated_prompt_splits.items()
+        if len(rows) > 0
+    })
+    ds_dict.push_to_hub(
+        prompts_repo_id,
+        private=True,
+        commit_message=f"[{split_name}] Prompts complete ({len(prompts)} rows)",
+    )
+    print(f"[HF Prompts Synced] {split_name} ({len(prompts)} rows)")
 
 def push_directions_and_evals_to_hf(cfg):
     """
@@ -466,7 +477,8 @@ def run_pipeline(config_path, model_path, batch_size):
             prompts=split_prompts,
             split_name=split_name,
             accumulated_prompt_splits=accumulated_prompt_splits,
-            checkpoint_every=5,
+            checkpoint_every=50,
+            upload_interval_sec=360
         )
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
